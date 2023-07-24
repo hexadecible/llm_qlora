@@ -1,12 +1,11 @@
 import torch
 import transformers
+from datasets import load_dataset
+from datasets.dataset_dict import DatasetDict
 from peft import (LoraConfig, PeftModel, get_peft_model,
                   prepare_model_for_kbit_training)
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, LlamaForCausalLM, LlamaTokenizer)
-
-from data_processor.RawTextDataProcessor import RawTextDataProcessor
-from data_processor.VicunaDataProcessor import VicunaDataProcessor
 
 
 class QloraTrainer:
@@ -16,7 +15,6 @@ class QloraTrainer:
         self.base_model = None
         self.adapter_model = None
         self.merged_model = None
-        self.data_processor = None
 
     def load_base_model(self):
         model_id = self.config["base_model"]
@@ -53,14 +51,13 @@ class QloraTrainer:
     def train(self):
         # Set up lora config or load pre-trained adapter
         if self.adapter_model is None:
-            config_dict = self.config["lora"]
             config = LoraConfig(
-                r=config_dict["r"],
-                lora_alpha=config_dict["lora_alpha"],
-                target_modules=config_dict["target_modules"],
-                lora_dropout=config_dict["lora_dropout"],
-                bias=config_dict["bias"],
-                task_type=config_dict["task_type"],
+                r=8,
+                lora_alpha=32,
+                target_modules=self.config["target_modules"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM"
             )
             model = get_peft_model(self.base_model, config)
         else:
@@ -68,22 +65,22 @@ class QloraTrainer:
         self._print_trainable_parameters(model)
 
         print("Start data preprocessing")
-        self._setup_data_processor()
-        data = self.data_processor.get_data()
+        # TODO: Expand this to cover more dataset types and processing patterns
+        data = self._process_vicuna_data()
 
         print("Start training")
-        config_dict = self.config["trainer"]
         trainer = transformers.Trainer(
             model=model,
             train_dataset=data["train"],
             args=transformers.TrainingArguments(
-                per_device_train_batch_size=config_dict["batch_size"],
-                gradient_accumulation_steps=config_dict["gradient_accumulation_steps"],
-                warmup_steps=config_dict["warmup_steps"],
-                num_train_epochs=config_dict["num_train_epochs"],
-                learning_rate=config_dict["learning_rate"],
+                per_device_train_batch_size=1,
+                gradient_accumulation_steps=4,
+                warmup_steps=100,
+                #max_steps=200,  # short run for debugging
+                num_train_epochs=1,  # full run
+                learning_rate=2e-4,
                 fp16=True,
-                logging_steps=config_dict["logging_steps"],
+                logging_steps=20,
                 output_dir=self.config["trainer_output_dir"],
                 report_to="tensorboard",
                 #optim="adamw"
@@ -134,10 +131,45 @@ class QloraTrainer:
             f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
         )
 
-    def _setup_data_processor(self):
-        if self.config["data"]["type"] == "vicuna":
-            self.data_processor = VicunaDataProcessor(self.config, self.tokenizer)
-        elif self.config["data"]["type"] == "raw_text":
-            self.data_processor = RawTextDataProcessor(self.config, self.tokenizer)
+    def _generate_prompt(self, convo: list, eos_token: str, instruct: bool = False) -> str:
+      convo_text = ""
+      for turn in convo:
+          entity = turn["from"]
+          value = turn["value"]
+  
+          if entity == "system":
+              convo_text += "### SYSTEM:\n"
+              end_token = ""
+          elif entity == "human":
+              convo_text += "### HUMAN:\n"
+              end_token = ""
+          elif entity == "gpt":
+              convo_text += "### RESPONSE:\n"
+              end_token = eos_token  # LLM should stop its output after the response
+          else:
+              print(f"WARNING: unknown entity {entity}")
+              convo_text += f"### {entity.upper()}:\n"
+              end_token = ""
+  
+          convo_text += value + end_token + "\n\n"
+  
+          if instruct and entity == "gpt":
+              return convo_text
+      return convo_text
+
+    def _process_vicuna_data(self) -> DatasetDict:
+        if "model_context_window" in self.config:
+            context_window = self.config["model_context_window"]
         else:
-            raise ValueError("Dataset type not specified in config.data.type")
+            context_window = self.tokenizer.model_max_length
+
+        data = load_dataset(self.config["dataset"])
+        data = data.map(lambda data_point: self.tokenizer(
+            self._generate_prompt(
+                data_point["conversations"],
+                self.tokenizer.eos_token, 
+                instruct=self.config["instruct"]),
+            max_length=context_window,
+            truncation=True,
+        ))
+        return data
